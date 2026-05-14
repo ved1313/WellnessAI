@@ -1,28 +1,77 @@
 import { NextRequest } from 'next/server';
 import { getServerClient } from '@/lib/supabase';
 
-function getUserId(req: NextRequest): string | null {
+const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function getAuthToken(req: NextRequest): string | null {
   const auth = req.headers.get('authorization');
   if (!auth) return null;
-  const [, token] = auth.split(' ');
-  return token || null;
+  const [scheme, token] = auth.split(' ');
+  if (!token || scheme.toLowerCase() !== 'bearer') return null;
+  return token;
+}
+
+type ServerClient = NonNullable<ReturnType<typeof getServerClient>>;
+
+async function resolveUserId(supabase: ServerClient, token: string): Promise<string | null> {
+  if (uuidRegex.test(token)) return token;
+
+  const looksLikeEmail = token.includes('@');
+  if (looksLikeEmail) {
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .select('user_id')
+      .ilike('email', token)
+      .maybeSingle();
+    if (error) return null;
+    return data?.user_id ?? null;
+  }
+
+  const { data: userRow, error: userErr } = await supabase
+    .from('user_profiles')
+    .select('user_id')
+    .ilike('username', token)
+    .maybeSingle();
+  if (!userErr && userRow?.user_id) return userRow.user_id;
+
+  const { data: nameRow, error: nameErr } = await supabase
+    .from('user_profiles')
+    .select('user_id')
+    .ilike('display_name', token)
+    .maybeSingle();
+  if (nameErr) return null;
+  return nameRow?.user_id ?? null;
 }
 
 export async function GET(req: NextRequest) {
   try {
-    const userId = getUserId(req);
-    if (!userId) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
+    const token = getAuthToken(req);
+    if (!token) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
     const supabase = getServerClient();
     if (!supabase) return new Response(JSON.stringify({ error: 'supabase not configured' }), { status: 500 });
+
+    const userId = await resolveUserId(supabase, token);
+    if (!userId) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
 
     const { searchParams } = new URL(req.url);
     const sessionId = searchParams.get('session_id');
     if (!sessionId) return new Response(JSON.stringify({ error: 'session_id required' }), { status: 400 });
 
+    const { data: session, error: sessionError } = await supabase
+      .from('chat_sessions')
+      .select('id')
+      .eq('id', sessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (sessionError) throw sessionError;
+    if (!session) return new Response(JSON.stringify({ error: 'session not found' }), { status: 404 });
+
     const { data, error } = await supabase
       .from('chat_messages')
       .select('id,role,content:prompt,ai_response,created_at')
       .eq('session_id', sessionId)
+      .eq('user_id', userId)
       .order('created_at', { ascending: true })
       .limit(200);
 
@@ -45,15 +94,28 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const userId = getUserId(req);
-    if (!userId) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
+    const token = getAuthToken(req);
+    if (!token) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
     const supabase = getServerClient();
     if (!supabase) return new Response(JSON.stringify({ error: 'supabase not configured' }), { status: 500 });
 
-  const body = (await req.json().catch(() => ({}))) as { session_id?: string; role?: string; content?: string };
-  const { session_id, role, content } = body;
+    const userId = await resolveUserId(supabase, token);
+    if (!userId) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
+
+    const body = (await req.json().catch(() => ({}))) as { session_id?: string; role?: string; content?: string };
+    const { session_id, role, content } = body;
     if (!session_id) return new Response(JSON.stringify({ error: 'session_id required' }), { status: 400 });
     if (!role || !content) return new Response(JSON.stringify({ error: 'role and content required' }), { status: 400 });
+
+    const { data: session, error: sessionError } = await supabase
+      .from('chat_sessions')
+      .select('id')
+      .eq('id', session_id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (sessionError) throw sessionError;
+    if (!session) return new Response(JSON.stringify({ error: 'session not found' }), { status: 404 });
 
     // Insert message. For assistant role, store in ai_response column; for user role store in prompt.
     const insertPayload = role === 'assistant'
